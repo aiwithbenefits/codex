@@ -1,6 +1,6 @@
 import type { ReviewDecision } from "./review.js";
 import type { ApplyPatchCommand, ApprovalPolicy } from "../../approvals.js";
-import type { AppConfig } from "../config.js";
+import type { AppConfig, McpRequireApprovalValueCli, McpServerCliConfig } from "../config.js";
 import type { ResponseEvent } from "../responses.js";
 import type {
   ResponseFunctionToolCall,
@@ -11,6 +11,52 @@ import type {
   Tool,
 } from "openai/resources/responses/responses.mjs";
 import type { Reasoning } from "openai/resources.mjs";
+
+// Added for MCP tools
+export interface McpToolApiParams {
+  type: "mcp";
+  server_label: string;
+  server_url: string;
+  require_approval?: McpRequireApprovalValueCli;
+  allowed_tools?: string[];
+  headers?: Record<string, string>;
+}
+
+type CliTool = FunctionTool | { type: "local_shell" } | McpToolApiParams;
+
+// Interfaces for MCP-specific API response item data
+export interface McpListedToolInfoCli {
+  name: string;
+  input_schema: Record<string, any>; // Corresponds to JSON Schema value
+  description?: string;
+}
+
+export interface McpListToolsData {
+  server_label: string;
+  tools: McpListedToolInfoCli[];
+}
+
+export interface McpErrorDetailCli {
+  code: number;
+  message: string;
+  data?: any;
+}
+
+export interface McpCallData {
+  server_label: string;
+  name: string; // tool name
+  arguments: string; // JSON string of arguments
+  output: string; // JSON string of the tool's output
+  error?: McpErrorDetailCli | null;
+  approval_request_id?: string;
+}
+
+export interface McpApprovalRequestData {
+  server_label: string;
+  name: string; // tool name
+  arguments: string; // JSON string of arguments
+}
+
 
 import { CLI_VERSION } from "../../version.js";
 import {
@@ -617,9 +663,33 @@ export class AgentLoop {
       // `disableResponseStorage === true`.
       let transcriptPrefixLen = 0;
 
-      let tools: Array<Tool> = [shellFunctionTool];
+      let tools: CliTool[] = []; // Changed type here
       if (this.model.startsWith("codex")) {
-        tools = [localShellTool];
+          tools = [localShellTool as { type: "local_shell" }];
+      } else {
+          tools = [shellFunctionTool];
+      }
+
+      if (this.config.mcpServers) {
+          for (const [serverKey, mcpConf] of Object.entries(this.config.mcpServers)) {
+              if (mcpConf.server_url) {
+                  const mcpToolToAdd: McpToolApiParams = {
+                      type: "mcp",
+                      server_label: mcpConf.server_label || serverKey, // Use configured label or key
+                      server_url: mcpConf.server_url,
+                  };
+                  if (mcpConf.require_approval) {
+                      mcpToolToAdd.require_approval = mcpConf.require_approval;
+                  }
+                  if (mcpConf.allowed_tools) {
+                      mcpToolToAdd.allowed_tools = mcpConf.allowed_tools;
+                  }
+                  if (mcpConf.headers) {
+                      mcpToolToAdd.headers = mcpConf.headers;
+                  }
+                  tools.push(mcpToolToAdd);
+              }
+          }
       }
 
       const stripInternalFields = (
@@ -798,16 +868,20 @@ export class AgentLoop {
               .filter(Boolean)
               .join("\n");
 
-            const responseCall =
-              !this.config.provider ||
-              this.config.provider?.toLowerCase() === "openai"
+            const useResponsesApi = tools.some(t => t.type === 'mcp') ||
+                                   (!this.config.provider || this.config.provider?.toLowerCase() === "openai");
+
+            const responseCall = useResponsesApi
                 ? (params: ResponseCreateParams) =>
                     this.oai.responses.create(params)
                 : (params: ResponseCreateParams) =>
                     responsesCreateViaChatCompletions(
-                      this.oai,
-                      params as ResponseCreateParams & { stream: true },
+                        this.oai,
+                        params as ResponseCreateParams & { stream: true },
                     );
+            if (tools.some(t => t.type === 'mcp') && !useResponsesApi) {
+                log("[codex] Warning: MCP tools are present, but the current provider configuration might not use the OpenAI Responses API, which is required for MCP tools.");
+            }
             log(
               `instructions (length ${mergedInstructions.length}): ${mergedInstructions}`,
             );
@@ -1040,7 +1114,9 @@ export class AgentLoop {
 
               // process and surface each item (no-op until we can depend on streaming events)
               if (event.type === "response.output_item.done") {
-                const item = event.item;
+                const item = event.item as OpenAI.Responses.ResponseItem; // event.item from SDK
+                const item_id = item.id; // Assuming 'id' is a common field on ResponseItem from SDK
+
                 // 1) if it's a reasoning item, annotate it
                 type ReasoningItem = { type?: string; duration_ms?: number };
                 const maybeReasoning = item as ReasoningItem;
@@ -1061,7 +1137,37 @@ export class AgentLoop {
                   if (callId) {
                     this.pendingAborts.add(callId);
                   }
-                } else {
+                } else if (item.type === "mcp_list_tools") {
+                  const mcpData = item as unknown as McpListToolsData;
+                  log(`[MCP] Received mcp_list_tools from server '${mcpData.server_label}': ${mcpData.tools.length} tools listed.`);
+                  this.onItem({
+                    id: item_id,
+                    type: "message",
+                    role: "system",
+                    content: [{
+                      type: "input_text",
+                      text: `[MCP Info] Server '${mcpData.server_label}' reported ${mcpData.tools.length} tools.`
+                    }],
+                  } as ResponseItem);
+                } else if (item.type === "mcp_call") {
+                  const mcpData = item as unknown as McpCallData;
+                  log(`[MCP] Received mcp_call result for tool '${mcpData.name}' on server '${mcpData.server_label}'. Success: ${!mcpData.error}. ID: ${item_id}`);
+                  // This item will be processed by processEventsWithoutStreaming to generate the ResponseInputItem
+                  stageItem(item as ResponseItem);
+                } else if (item.type === "mcp_approval_request") {
+                  const mcpData = item as unknown as McpApprovalRequestData;
+                  log(`[MCP] Received mcp_approval_request for tool '${mcpData.name}' on server '${mcpData.server_label}'. ID: ${item_id}. Arguments: ${mcpData.arguments}. This will be ignored.`);
+                  this.onItem({
+                    id: item_id,
+                    type: "message",
+                    role: "system",
+                    content: [{
+                      type: "input_text",
+                      text: `[MCP Action] Approval requested for tool '${mcpData.server_label}/${mcpData.name}'. This request is being automatically ignored as per current policy. The tool will not run.`
+                    }],
+                  } as ResponseItem);
+                }
+                else {
                   stageItem(item as ResponseItem);
                 }
               }
@@ -1570,27 +1676,35 @@ export class AgentLoop {
     }
     const turnInput: Array<ResponseInputItem> = [];
     for (const item of output) {
+      // Ensure item has an id for alreadyProcessedResponses check
+      const currentItemId = (item as { id?: string }).id;
+      if (currentItemId && alreadyProcessedResponses.has(currentItemId)) {
+        continue;
+      }
+      if (currentItemId) {
+        alreadyProcessedResponses.add(currentItemId);
+      }
+
       if (item.type === "function_call") {
-        if (alreadyProcessedResponses.has(item.id)) {
-          continue;
-        }
-        alreadyProcessedResponses.add(item.id);
         // eslint-disable-next-line no-await-in-loop
-        const result = await this.handleFunctionCall(item);
+        const result = await this.handleFunctionCall(item as ResponseFunctionToolCall);
         turnInput.push(...result);
-        //@ts-expect-error - waiting on sdk
       } else if (item.type === "local_shell_call") {
-        //@ts-expect-error - waiting on sdk
-        if (alreadyProcessedResponses.has(item.id)) {
-          continue;
-        }
-        //@ts-expect-error - waiting on sdk
-        alreadyProcessedResponses.add(item.id);
         // eslint-disable-next-line no-await-in-loop
         const result = await this.handleLocalShellCall(item);
         turnInput.push(...result);
+      } else if (item.type === "mcp_call") {
+        const mcpCallItem = item as unknown as ({ id: string } & McpCallData);
+        log(`[MCP Process] Processing mcp_call for tool '${mcpCallItem.name}' on server '${mcpCallItem.server_label}'. ID: ${mcpCallItem.id}`);
+        const mcpOutputItem: ResponseInputItem.FunctionCallOutput = {
+          type: "function_call_output",
+          call_id: mcpCallItem.id, // Use the ID of the mcp_call event item
+          output: mcpCallItem.output, // This is the JSON string output from the tool
+        };
+        turnInput.push(mcpOutputItem);
       }
-      emitItem(item as ResponseItem);
+      // emitItem is called in the stream loop via stageItem, so not needed here
+      // emitItem(item as ResponseItem); 
     }
     return turnInput;
   }

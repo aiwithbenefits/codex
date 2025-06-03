@@ -23,6 +23,14 @@ pub enum ResponseInputItem {
         call_id: String,
         result: Result<CallToolResult, String>,
     },
+    #[serde(rename = "mcp_approval_response")]
+    McpApproval(McpApprovalResponseInput),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpApprovalResponseInput {
+    pub approval_request_id: String,
+    pub approve: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +81,58 @@ pub enum ResponseItem {
     },
     #[serde(other)]
     Other,
+
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools(McpListToolsOutput),
+
+    #[serde(rename = "mcp_call")]
+    McpCall(McpCallOutput),
+
+    #[serde(rename = "mcp_approval_request")]
+    McpApprovalRequest(McpApprovalRequestOutput),
+}
+
+// Helper structs for the new ResponseItem variants
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct McpListedToolInfo {
+    pub name: String,
+    pub input_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct McpListToolsOutput {
+    pub server_label: String,
+    pub tools: Vec<McpListedToolInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct McpErrorDetail {
+    pub code: i64,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct McpCallOutput {
+    pub server_label: String,
+    pub name: String, // Tool name
+    pub arguments: String, // JSON string of arguments
+    pub output: String, // JSON string of the tool's output
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<McpErrorDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct McpApprovalRequestOutput {
+    pub server_label: String,
+    pub name: String, // Tool name
+    pub arguments: String, // JSON string of arguments
 }
 
 impl From<ResponseInputItem> for ResponseItem {

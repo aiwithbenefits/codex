@@ -38,6 +38,7 @@ use crate::client::ModelClient;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::config::Config;
+use crate::config_types::McpServerConfig;
 use crate::config_types::ShellEnvironmentPolicy;
 use crate::conversation_history::ConversationHistory;
 use crate::error::CodexErr;
@@ -63,6 +64,7 @@ use crate::project_doc::create_full_instructions;
 use crate::protocol::AgentMessageEvent;
 use crate::protocol::AgentReasoningEvent;
 use crate::protocol::ApplyPatchApprovalRequestEvent;
+use crate::protocol::McpApprovalRequestEvent;
 use crate::protocol::AskForApproval;
 use crate::protocol::BackgroundEventEvent;
 use crate::protocol::ErrorEvent;
@@ -181,6 +183,7 @@ pub(crate) struct Session {
 
     /// Manager for external MCP servers/tools.
     mcp_connection_manager: McpConnectionManager,
+    mcp_server_configs: Arc<HashMap<String, McpServerConfig>>,
 
     /// External notifier command (will be passed as args to exec()). When
     /// `None` this feature is disabled.
@@ -666,8 +669,11 @@ async fn submission_loop(
                     notify,
                     state: Mutex::new(state),
                     rollout: Mutex::new(rollout_recorder),
+                    mcp_server_configs: mcp_server_configs_arc, 
                     codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
                 }));
+
+                //let mcp_server_configs_arc = Arc::new(config.mcp_servers.clone()); Removed this line as it's now placed before Session struct creation
 
                 // Gather history metadata for SessionConfiguredEvent.
                 let (history_log_id, history_entry_count) =
@@ -1017,6 +1023,7 @@ async fn run_turn(
         instructions,
         store,
         extra_tools,
+        mcp_configs: Some(sess.mcp_server_configs.clone()), // Add this line
     };
 
     let mut retries = 0;
@@ -1081,9 +1088,9 @@ async fn try_run_turn(
     let mut output = Vec::new();
     for event in input {
         match event {
-            ResponseEvent::OutputItemDone(item) => {
-                let response = handle_response_item(sess, sub_id, item.clone()).await?;
-                output.push(ProcessedResponseItem { item, response });
+            ResponseEvent::OutputItemDone { item_id, item_data } => {
+                let response = handle_response_item(sess, sub_id, item_id, item_data.clone()).await?;
+                output.push(ProcessedResponseItem { item: item_data, response });
             }
             ResponseEvent::Completed { response_id } => {
                 let mut state = sess.state.lock().unwrap();
@@ -1098,13 +1105,14 @@ async fn try_run_turn(
 async fn handle_response_item(
     sess: &Session,
     sub_id: &str,
-    item: ResponseItem,
+    item_id: String, // Added item_id
+    item_data: ResponseItem, // Renamed item to item_data
 ) -> CodexResult<Option<ResponseInputItem>> {
-    debug!(?item, "Output item");
-    let output = match item {
+    debug!(?item_data, "Output item");
+    let output = match item_data {
         ResponseItem::Message { content, .. } => {
-            for item in content {
-                if let ContentItem::OutputText { text } = item {
+            for item_content in content { // Renamed item to item_content to avoid conflict
+                if let ContentItem::OutputText { text } = item_content {
                     let event = Event {
                         id: sub_id.to_string(),
                         msg: EventMsg::AgentMessage(AgentMessageEvent { message: text }),
@@ -1115,8 +1123,8 @@ async fn handle_response_item(
             None
         }
         ResponseItem::Reasoning { id: _, summary } => {
-            for item in summary {
-                let text = match item {
+            for summary_item in summary { // Renamed item to summary_item
+                let text = match summary_item {
                     ReasoningItemReasoningSummary::SummaryText { text } => text,
                 };
                 let event = Event {
@@ -1133,11 +1141,12 @@ async fn handle_response_item(
             call_id,
         } => {
             tracing::info!("FunctionCall: {arguments}");
+            // Existing FunctionCall uses its own call_id, not the top-level item_id from OpenAI event
             Some(handle_function_call(sess, sub_id.to_string(), name, arguments, call_id).await)
         }
         ResponseItem::LocalShellCall {
             id,
-            call_id,
+            call_id, // This is the one to use for the response
             status: _,
             action,
         } => {
@@ -1148,20 +1157,35 @@ async fn handle_response_item(
                 workdir: action.working_directory,
                 timeout_ms: action.timeout_ms,
             };
-            let effective_call_id = match (call_id, id) {
-                (Some(call_id), _) => call_id,
-                (None, Some(id)) => id,
-                (None, None) => {
-                    error!("LocalShellCall without call_id or id");
-                    return Ok(Some(ResponseInputItem::FunctionCallOutput {
-                        call_id: "".to_string(),
-                        output: FunctionCallOutputPayload {
-                            content: "LocalShellCall without call_id or id".to_string(),
-                            success: None,
-                        },
-                    }));
-                }
-            };
+            // Prioritize call_id if present (from Responses API), then id (from Chat API)
+            let effective_call_id = call_id.or(id).unwrap_or_else(|| {
+                error!("LocalShellCall without call_id or id");
+                // Fallback to an empty string or generate a new UUID if critical,
+                // but OpenAI usually provides one. For now, using item_id (the event's own ID)
+                // if specific ones are missing, though this might not be what OpenAI expects for reply correlation.
+                // However, the original code already had a fallback for this.
+                // Let's stick to the original logic of effective_call_id for now.
+                // The prompt implies existing calls use their embedded IDs.
+                // The original code was:
+                // let effective_call_id = match (call_id, id) { (Some(call_id), _) => call_id, (None, Some(id)) => id, ... }
+                // This was correct. I'll ensure it's preserved or correctly adapted.
+                // The `call_id` in `LocalShellCall` IS the one to use. If it's None, then `id` is used.
+                // So `effective_call_id` logic should remain as is.
+                // The prompt asks to use `item_id` primarily for NEW items.
+                // The existing LocalShellCall has `id` (optional, for chat) and `call_id` (optional, for responses api).
+                // The previous logic `let effective_call_id = call_id.or(id).unwrap_or_else(|| { item_id.clone() });` might be better
+                // if we absolutely need an ID.
+                // For now, sticking to original effective_call_id logic which might error out if both are None.
+                // The original code for effective_call_id:
+                 match (call_id.clone(), id.clone()) { // .clone() because we might use item_id later
+                    (Some(cid), _) => cid,
+                    (None, Some(i)) => i,
+                    (None, None) => {
+                         error!("LocalShellCall without specific call_id or id, using event item_id as fallback: {}", item_id);
+                         item_id // Fallback to the event's item_id if specific ones are missing.
+                    }
+                 }
+            });
 
             let exec_params = to_exec_params(params, sess);
             Some(
@@ -1169,10 +1193,50 @@ async fn handle_response_item(
                     exec_params,
                     sess,
                     sub_id.to_string(),
-                    effective_call_id,
+                    effective_call_id, // Use the determined ID
                 )
                 .await,
             )
+        }
+        ResponseItem::McpListTools(output) => {
+            info!("[{}] Received tool list from MCP server '{}': {} tools", sub_id, output.server_label, output.tools.len());
+            // sess.notify_background_event(sub_id, format!("MCP Server '{}' reported {} tools.", output.server_label, output.tools.len())).await;
+            Ok(None)
+        }
+        ResponseItem::McpCall(output) => {
+            info!("[{}] MCP tool '{}/{}' called. Success: {}. ID for response: {}", sub_id, output.server_label, output.name, output.error.is_none(), item_id);
+            Ok(Some(ResponseInputItem::FunctionCallOutput {
+                call_id: item_id, // Use the McpCall event's own ID for the response correlation
+                output: FunctionCallOutputPayload {
+                    content: output.output, // This is the JSON string output from the tool
+                    success: Some(output.error.is_none()),
+                },
+            }))
+        }
+        ResponseItem::McpApprovalRequest(output) => {
+            // item_id is the McpApprovalRequest's own ID (e.g., "mcpr_...")
+            warn!(
+                "[{}] Received unexpected MCP approval request for tool '{}/{}' on server '{}' (ID: {}). Arguments: {}. This will be ignored as per current policy (no interactive MCP approval).",
+                sub_id, output.server_label, output.name, output.server_label, item_id, output.arguments
+            );
+
+            // Notify the client that an approval request was received and will be ignored.
+            let event_payload = McpApprovalRequestEvent {
+                approval_request_id: item_id.clone(), // Pass the original request ID
+                server_label: output.server_label.clone(),
+                tool_name: output.name.clone(),
+                arguments: output.arguments.clone(),
+            };
+            // It's good practice to inform the client, even if it's just for logging/display that it was ignored.
+            // The client might display this as "Approval requested for X, automatically ignored."
+            sess.send_event(Event {
+                id: sub_id.to_string(), // Use the submission ID for the event context
+                msg: EventMsg::McpApprovalRequest(event_payload),
+            }).await;
+            
+            // No ResponseInputItem is returned, effectively 'denying' or 'ignoring' the request.
+            // OpenAI will not proceed with the tool call if it doesn't get an mcp_approval_response.
+            Ok(None)
         }
         ResponseItem::FunctionCallOutput { .. } => {
             debug!("unexpected FunctionCallOutput from stream");

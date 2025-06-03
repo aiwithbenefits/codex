@@ -9,16 +9,29 @@ use wildmatch::WildMatchPattern;
 
 use serde::Deserialize;
 use serde::Serialize;
+use crate::openai_tools::{McpRequireApproval, McpToolHeaders}; // Import new types
 
-#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Default)]
 pub struct McpServerConfig {
-    pub command: String,
+    // --- Existing fields ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>, // Made Option to allow Default trait
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
 
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<HashMap<String, String>>,
+
+    // --- New fields for remote MCP servers ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_approval: Option<McpRequireApproval>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<McpToolHeaders>,
 }
 
 #[derive(Deserialize, Debug, Copy, Clone, PartialEq)]

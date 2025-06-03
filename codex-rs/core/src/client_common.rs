@@ -1,3 +1,4 @@
+use crate::config_types::McpServerConfig; // Added import
 use crate::config_types::ReasoningEffort as ReasoningEffortConfig;
 use crate::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use crate::error::Result;
@@ -5,8 +6,9 @@ use crate::models::ResponseItem;
 use futures::Stream;
 use serde::Serialize;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::HashMap; // Ensure this is present
 use std::pin::Pin;
+use std::sync::Arc; // Ensure this is present
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
@@ -31,7 +33,11 @@ pub struct Prompt {
     /// Additional tools sourced from external MCP servers. Note each key is
     /// the "fully qualified" tool name (i.e., prefixed with the server name),
     /// which should be reported to the model in place of Tool::name.
-    pub extra_tools: HashMap<String, mcp_types::Tool>,
+    pub extra_tools: HashMap<String, mcp_types::Tool>, // This existing field remains
+
+    /// Configurations for MCP servers, primarily for remote ones to be passed to OpenAI.
+    /// The key is the server_label.
+    pub mcp_configs: Option<Arc<HashMap<String, McpServerConfig>>>, // New field
 }
 
 impl Prompt {
@@ -48,7 +54,10 @@ impl Prompt {
 
 #[derive(Debug)]
 pub enum ResponseEvent {
-    OutputItemDone(ResponseItem),
+    OutputItemDone {
+        item_id: String,
+        item_data: ResponseItem,
+    },
     Completed { response_id: String },
 }
 

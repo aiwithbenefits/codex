@@ -107,6 +107,21 @@ pub enum Op {
 
     /// Request a single history entry identified by `log_id` + `offset`.
     GetHistoryEntryRequest { offset: usize, log_id: u64 },
+    McpApproval(McpApprovalDetails),
+}
+
+/// User's decision in response to an McpApprovalRequestEvent.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum McpApprovalDecision {
+    Approve,
+    Deny,
+}
+
+/// Details for an MCP approval operation from client to backend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpApprovalDetails {
+    pub approval_request_id: String,
+    pub decision: McpApprovalDecision,
 }
 
 /// Determines how liberally commands are auto‑approved by the system.
@@ -362,6 +377,16 @@ pub enum EventMsg {
 
     /// Response to GetHistoryEntryRequest.
     GetHistoryEntryResponse(GetHistoryEntryResponseEvent),
+    McpApprovalRequest(McpApprovalRequestEvent),
+}
+
+/// Event from backend to client requesting approval for an MCP tool call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpApprovalRequestEvent {
+    pub approval_request_id: String, // The ID of the MCP approval request item (e.g., "mcpr_...")
+    pub server_label: String,
+    pub tool_name: String,
+    pub arguments: String, // JSON string of arguments
 }
 
 // Individual event payload types matching each `EventMsg` variant.

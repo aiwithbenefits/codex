@@ -137,6 +137,19 @@ export function getApiKey(provider: string = "openai"): string | undefined {
 
 export type FileOpenerScheme = "vscode" | "cursor" | "windsurf";
 
+export type McpRequireApprovalValueCli =
+  | "never"
+  | "always"
+  | { never: { tool_names: string[] } };
+
+export interface McpServerCliConfig {
+  server_url: string;
+  server_label: string;
+  require_approval?: McpRequireApprovalValueCli;
+  allowed_tools?: string[];
+  headers?: Record<string, string>;
+}
+
 // Represents config as persisted in config.json.
 export type StoredConfig = {
   model?: string;
@@ -164,12 +177,14 @@ export type StoredConfig = {
   /** User-defined safe commands */
   safeCommands?: Array<string>;
   reasoningEffort?: ReasoningEffort;
+  mcpServers?: Record<string, McpServerCliConfig>;
 
   /**
    * URI-based file opener. This is used when linking code references in
    * terminal output.
    */
   fileOpener?: FileOpenerScheme;
+  // mcpServers?: Record<string, McpServerCliConfig>; // Removed duplicate line
 };
 
 // Minimal config written on first run.  An *empty* model string ensures that
@@ -439,6 +454,7 @@ export const loadConfig = (
     disableResponseStorage: storedConfig.disableResponseStorage === true,
     reasoningEffort: storedConfig.reasoningEffort,
     fileOpener: storedConfig.fileOpener,
+    mcpServers: storedConfig.mcpServers,
   };
 
   // -----------------------------------------------------------------------
@@ -560,6 +576,7 @@ export const saveConfig = (
     disableResponseStorage: config.disableResponseStorage,
     flexMode: config.flexMode,
     reasoningEffort: config.reasoningEffort,
+    mcpServers: config.mcpServers,
   };
 
   // Add history settings if they exist

@@ -203,6 +203,7 @@ impl ModelClient {
 struct SseEvent {
     #[serde(rename = "type")]
     kind: String,
+    id: Option<String>, // Added field to capture the event's own ID
     response: Option<Value>,
     item: Option<Value>,
 }
@@ -286,13 +287,17 @@ where
             // drop the duplicated list inside `response.completed`.
             "response.output_item.done" => {
                 let Some(item_val) = event.item else { continue };
-                let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) else {
+                let Some(item_id) = event.id else {
+                    debug!("Missing id in response.output_item.done event");
+                    continue;
+                };
+                let Ok(item_data) = serde_json::from_value::<ResponseItem>(item_val) else {
                     debug!("failed to parse ResponseItem from output_item.done");
                     continue;
                 };
 
-                let event = ResponseEvent::OutputItemDone(item);
-                if tx_event.send(Ok(event)).await.is_err() {
+                let response_event = ResponseEvent::OutputItemDone { item_id, item_data };
+                if tx_event.send(Ok(response_event)).await.is_err() {
                     return;
                 }
             }
